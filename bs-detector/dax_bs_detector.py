@@ -127,56 +127,145 @@ def load_samples(csv_path: pathlib.Path, max_docs: int) -> pd.DataFrame:
         df = df.reset_index(drop=True)
     return df
 
-def build_preview_html(df_out: pd.DataFrame, threshold: float):
-    rows = []
-    for i, row in df_out.head(50).iterrows():
-        html = highlight_weasels_html(str(row["text"]))
-        rows.append(f"""
-        <tr>
-          <td>{i}</td><td>{row.get('company','')}</td><td>{row.get('source','')}</td>
-          <td>{row['vagueness_score']:.3f}</td><td>{row['label']}</td>
-          <td class="txt">{html}</td>
-        </tr>""")
-    html = f"""<html><head><meta charset="utf-8"/><style>
-      body{{font-family:-apple-system,Segoe UI,Roboto,Arial}} table{{border-collapse:collapse;width:100%}}
-      th,td{{border:1px solid #ddd;padding:8px;vertical-align:top}} th{{background:#f6f6f6;position:sticky;top:0}}
-      .weasel{{background:#ffd5d5;color:#900;font-weight:600}} .passive{{background:#ffe9c9}} .txt{{max-width:900px}}
-    </style></head><body>
+def build_preview_html(df_out: pd.DataFrame, threshold: float, top_n: int = 50):
+    """渲染预览页：按分数降序展示 top_n 条，并附 Summary（按 datatype / domain 的均分&命中率）"""
+
+    # 取需要展示的列是否存在
+    has_domain = "domain" in df_out.columns
+    has_dtype  = "datatype" in df_out.columns
+
+    # Summary：按 datatype / domain 聚合
+    summ_parts = []
+    if has_dtype:
+        by_type = df_out.groupby("datatype").agg(
+            mean_score=("vagueness_score","mean"),
+            bs_rate=("label","mean"),
+            n=("label","size"),
+        ).sort_values("mean_score", ascending=False).round(3)
+        summ_parts.append("<p><b>By datatype</b></p>" + by_type.to_html(escape=False))
+
+    if has_domain:
+        by_domain = df_out.groupby("domain").agg(
+            mean_score=("vagueness_score","mean"),
+            bs_rate=("label","mean"),
+            n=("label","size"),
+        ).sort_values("mean_score", ascending=False).head(10).round(3)
+        summ_parts.append("<p><b>Top domains by score</b></p>" + by_domain.to_html(escape=False))
+
+    summary_html = "<h3>Summary</h3>" + ("".join(summ_parts) if summ_parts else "<p>(no grouping columns found)</p>")
+
+    # 表头
+    cols_header = ["#", "company"]
+    if has_domain: cols_header.append("domain")
+    if has_dtype:  cols_header.append("datatype")
+    cols_header += ["vagueness_score", "label", "weasel_cnt", "passive_cnt", "text (highlighted)"]
+
+    # 构建行（取前 top_n）
+    head = df_out.head(top_n)
+    rows_html = []
+    for i, row in head.iterrows():
+        html_txt = highlight_weasels_html(str(row.get("text","")))
+        tds = [
+            str(i),
+            str(row.get("company","")),
+        ]
+        if has_domain: tds.append(str(row.get("domain","")))
+        if has_dtype:  tds.append(str(row.get("datatype","")))
+        tds += [
+            f"{row['vagueness_score']:.3f}",
+            str(row.get("label","")),
+            str(row.get("weasel_cnt","")),
+            str(row.get("passive_cnt","")),
+            f'<div class="txt">{html_txt}</div>',
+        ]
+        rows_html.append("<tr>" + "".join(f"<td>{x}</td>" for x in tds) + "</tr>")
+
+    table_html = f"""
+    <table>
+      <tr>{"".join(f"<th>{h}</th>" for h in cols_header)}</tr>
+      {''.join(rows_html)}
+    </table>
+    """
+
+    # 页面模板
+    template = f"""
+    <html><head>
+      <meta charset="utf-8"/>
+      <style>
+        body {{ font-family:-apple-system, Segoe UI, Roboto, Arial; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
+        th {{ background:#f6f6f6; position: sticky; top: 0; }}
+        .weasel {{ background:#ffd5d5; color:#900; font-weight:600; }}
+        .passive {{ background:#ffe9c9; }}
+        .txt {{ max-width: 1000px; }}
+        .meta {{ color:#555; }}
+      </style>
+    </head><body>
       <h2>DAX ESG — Bullshit/Vagueness Preview</h2>
-      <p>Threshold = {threshold}（label 1 = bullshit）</p>
-      <table><tr><th>#</th><th>company</th><th>source</th><th>vagueness_score</th><th>label</th><th>text</th></tr>
-      {''.join(rows)}
-      </table></body></html>"""
-    pathlib.Path("preview.html").write_text(html, encoding="utf-8")
+      <p class="meta">Threshold = {threshold:.2f}（label 1 = bullshit） | Rows = {len(df_out)}</p>
+      {summary_html}
+      {table_html}
+    </body></html>
+    """
+
+    with open("preview.html","w",encoding="utf-8") as f:
+        f.write(template)
     print("Saved: preview.html")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max_docs", type=int, default=300, help="抽样文档数")
     ap.add_argument("--threshold", type=float, default=0.6, help=">= 阈值判为 1=BS")
+# argparse 增加两个开关
+    ap.add_argument("--quantile", type=float, default=None, help="用分位数自动设阈值，如 0.8 表示取 top20% 为 1")
+    ap.add_argument("--reports_only", action="store_true", help="仅评估 datatype=report 的文本")
+
     args = ap.parse_args()
 
     csv_path = get_dataset_csv_path()
     print("CSV:", csv_path)
+# 读取后可选过滤
     df = load_samples(csv_path, max_docs=args.max_docs)
+    if args.reports_only and "datatype" in df.columns:
+        df = df[df["datatype"].str.lower().eq("report")]
 
     scores, labels, feats = [], [], []
     for txt in df["text"].astype(str):
         r = compute_vagueness_score(txt, threshold=args.threshold)
         scores.append(r.score); labels.append(r.label); feats.append(r.features)
 
+# === 合并结果 ===
     out = pd.concat(
-        [df.reset_index(drop=True),
-         pd.Series(scores, name="vagueness_score"),
-         pd.Series(labels, name="label"),
-         pd.DataFrame(feats)],
-        axis=1
+        [
+            df.reset_index(drop=True),
+            pd.Series(scores, name="vagueness_score"),
+            pd.Series(labels, name="label"),
+            pd.DataFrame(feats),
+        ],
+        axis=1,
     )
+
+# === 排序：高分在前，方便预览锁定“最水”的 ===
+    out = out.sort_values("vagueness_score", ascending=False).reset_index(drop=True)
+
+# === 阈值：支持分位数自动阈值（若你之前在 argparse 里加了 --quantile） ===
+# 没加也没事，这里会自动忽略，使用你传入的 --threshold
+    thr = args.threshold
+    if hasattr(args, "quantile") and args.quantile is not None:
+        thr = float(out["vagueness_score"].quantile(args.quantile))
+        out["label"] = (out["vagueness_score"] >= thr).astype(int)
+        print(f"[auto] threshold(from quantile={args.quantile}) = {thr:.3f}, BS rate = {out['label'].mean():.1%}")
+
+# === 导出 CSV ===
     out.to_csv("dax_vagueness_scores.csv", index=False, encoding="utf-8")
     print(f"Saved: dax_vagueness_scores.csv (rows={len(out)})")
 
-    build_preview_html(out, args.threshold)
-    print(f"BS rate: {out['label'].mean():.1%} | mean score: {out['vagueness_score'].mean():.3f}")
+# === 生成 HTML 预览（前 50 条）===
+    build_preview_html(out, threshold=thr, top_n=50)
+
+# === 简要统计 ===
+    print(f"BS rate: {out['label'].mean():.1%} | mean score: {out['vagueness_score'].mean():.3f} | threshold: {thr:.2f}")
 
 if __name__ == "__main__":
     main()
