@@ -2,10 +2,11 @@ import argparse, json, re, pathlib
 from dataclasses import dataclass
 import pandas as pd
 import kagglehub
+import sys, csv  # 放在文件顶部（若已导入则忽略）
 
 # ========= 配置 =========
 TEXT_COLUMN = "content"   # 明确指定
-KEEP_COLS = ["company", "source", "datatype", "url", "date"]
+KEEP_COLS = ["company","datatype","date","domain","esg_topics","symbol","title","url","internal","source"]
 
 # ========= 规则与打分 =========
 WEASEL = r"\b(aim|aspire|strive|explore|consider|intend|plan to|promote|encourage|support|potentially|may|might|could|should|believe|likely|approximately|around|some|several|various|significant|robust|world[- ]class|best[- ]in[- ]class)\b"
@@ -78,21 +79,52 @@ def get_dataset_csv_path() -> pathlib.Path:
         raise FileNotFoundError("未找到 CSV 文件。")
     return any_csv[0]
 
+
+
 def load_samples(csv_path: pathlib.Path, max_docs: int) -> pd.DataFrame:
-    usecols = [c for c in [TEXT_COLUMN,*KEEP_COLS] if c]  # 只取必要列
-    acc = []
-    for chunk in pd.read_csv(csv_path, usecols=lambda c: c in usecols, dtype=str,
-                             on_bad_lines="skip", encoding="utf-8", chunksize=5000, engine="pyarrow"):
-        chunk = chunk.dropna(subset=[TEXT_COLUMN])
-        if chunk.empty: 
-            continue
-        acc.append(chunk)
-        if sum(len(x) for x in acc) >= max_docs:
-            break
-    if not acc:
-        raise RuntimeError(f"在 {csv_path.name} 中未找到可用文本列 `{TEXT_COLUMN}`")
-    df = pd.concat(acc, ignore_index=True).head(max_docs)
-    df = df.rename(columns={TEXT_COLUMN:"text"})
+    # 1) 先尝试用 pyarrow 整表读取（最稳，能处理长文本/多行）
+    try:
+        df = pd.read_csv(
+            csv_path,
+            sep="|",
+            engine="pyarrow",
+            dtype=str
+        )
+        print("[info] Loaded full CSV with pyarrow (pipe-delimited).")
+    except Exception as e:
+        print(f"[warn] pyarrow failed, fallback to python engine: {e}")
+        # 2) 回退到 python 引擎，并把单字段大小上限拉高
+        try:
+            csv.field_size_limit(min(sys.maxsize, 10**9))
+        except OverflowError:
+            csv.field_size_limit(10**9)
+        df = pd.read_csv(
+            csv_path,
+            sep="|",
+            engine="python",
+            dtype=str,
+            on_bad_lines="skip"
+        )
+
+    # 丢掉开头的“空表头/Unnamed”列（管道分隔导致的占位列）
+    drop_cols = [c for c in df.columns if (c is None) or (str(c).strip() == "") or str(c).startswith("Unnamed")]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    # 确认 content 存在
+    if "content" not in df.columns:
+        raise RuntimeError(f"`content` 不在列中：{df.columns.tolist()}")
+
+    # 只保留我们关心的列
+    keep = ["company","content","datatype","date","domain","esg_topics","internal","symbol","title","url"]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].rename(columns={"content": "text"}).dropna(subset=["text"])
+
+    # 抽样
+    if len(df) > max_docs:
+        df = df.sample(n=max_docs, random_state=42).reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
     return df
 
 def build_preview_html(df_out: pd.DataFrame, threshold: float):
