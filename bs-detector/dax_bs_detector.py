@@ -3,6 +3,24 @@ from dataclasses import dataclass
 import pandas as pd
 import kagglehub
 
+# --- extra deps for the tiny supervised layer (kept optional) ---
+# we import lazily later as well, but having them here helps type checkers chill
+import numpy as np
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report
+except Exception:
+    LogisticRegression = None
+try:
+    import joblib
+except Exception:
+    joblib = None
+
 # ---- config knobs (keep it boring, ship it) ----
 TEXT_COLUMN = "content"
 KEEP_COLS = ["company","datatype","date","domain","esg_topics","symbol","title","url","internal","source"]
@@ -144,7 +162,6 @@ def run_zeroshot_nli(texts, model_name="facebook/bart-large-mnli", batch_size=8)
         "zero-shot-classification",
         model=model_name,
         device=device,
-        # trust_remote_code False by default; keeping it simple
     )
     labels = ["vague and non-operational", "specific, measurable, and time-bound"]
     htemp = "This text is {}."
@@ -172,12 +189,96 @@ def run_zeroshot_nli(texts, model_name="facebook/bart-large-mnli", batch_size=8)
             n_lbl.append(1 if pv >= ps else 0)
     return n_vague, n_spec, n_lbl
 
+# ---- tiny supervised layer (embeddings + LR) ----
+def _need(pkg, name):
+    if pkg is None:
+        raise RuntimeError(f"{name} not installed. Try: pip install -U {name}")
+
+def _load_embedder(model_name: str):
+    _need(SentenceTransformer, "sentence-transformers")
+    print(f"[embed] loading {model_name} ...")
+    return SentenceTransformer(model_name)
+
+def _embed(embedder, texts, batch_size=64):
+    # L2-normalized embeddings; LR likes it tidy
+    embs = embedder.encode(
+        list(texts), batch_size=batch_size,
+        convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
+    )
+    return embs.astype("float32")
+
+def _tiny_feats_from_row(row, rule_score: float, nli_vague: float | None):
+    # cheap-but-effective tiny features
+    f_has_number  = 1.0 if row.get("has_number", False) else 0.0
+    f_has_deadln  = 1.0 if row.get("has_deadline", False) else 0.0
+    f_has_owner   = 1.0 if row.get("has_owner", False) else 0.0
+    f_nli         = float(nli_vague) if nli_vague is not None else 0.0
+    f_rule        = float(rule_score)
+    return np.array([f_rule, f_nli, f_has_number, f_has_deadln, f_has_owner], dtype="float32")
+
+def train_tiny_supervised(seed_csv: str, embed_model: str, train_ratio: float, save_path: str = "tiny_clf.joblib"):
+    _need(LogisticRegression, "scikit-learn"); _need(joblib, "joblib")
+    seeds = pd.read_csv(seed_csv)
+    if not {"text","y"}.issubset(seeds.columns):
+        raise ValueError("seeds.csv must have columns: text,y (y in {0,1})")
+    seeds["text"] = seeds["text"].astype(str)
+    seeds["y"] = seeds["y"].astype(int)
+
+    embedder = _load_embedder(embed_model)
+    X_embed = _embed(embedder, seeds["text"].tolist())
+
+    # compute rule/tiny feats on seeds; keep nli=0.0 here (fast path)
+    tiny = []
+    for t in seeds["text"]:
+        r = compute_vagueness_score(t, threshold=0.5)
+        tiny.append(_tiny_feats_from_row(r.features, r.score, nli_vague=0.0))
+    X_tiny = np.vstack(tiny)
+    X = np.hstack([X_embed, X_tiny])
+    y = seeds["y"].values
+
+    X_tr, X_va, y_tr, y_va = train_test_split(X, y, train_size=train_ratio, random_state=42, stratify=y)
+    clf = LogisticRegression(
+        solver="saga", penalty="l2", C=1.0, max_iter=2000,
+        class_weight="balanced", n_jobs=-1, verbose=0
+    )
+    clf.fit(X_tr, y_tr)
+    print("[tiny] trained logistic regression.")
+    y_hat = clf.predict(X_va)
+    print("[tiny] validation report:\n", classification_report(y_va, y_hat, digits=3))
+
+    artifact = {"clf": clf, "embed_model": embed_model, "embed_dim": X_embed.shape[1]}
+    joblib.dump(artifact, save_path)
+    print(f"[tiny] saved model to {save_path}")
+
+def predict_with_tiny(texts, model_path: str, embed_model: str | None):
+    _need(joblib, "joblib")
+    art = joblib.load(model_path)
+    use_model = embed_model or art.get("embed_model")
+    if use_model is None:
+        raise ValueError("missing embed_model; pass --embed_model or retrain.")
+    embedder = _load_embedder(use_model)
+    X_embed = _embed(embedder, texts)
+
+    # build tiny rule features on the fly (nli left as 0.0 unless you wire it in)
+    tiny = []
+    for t in texts:
+        r = compute_vagueness_score(t, threshold=0.5)
+        tiny.append(_tiny_feats_from_row(r.features, r.score, nli_vague=0.0))
+    X_tiny = np.vstack(tiny)
+    X = np.hstack([X_embed, X_tiny])
+
+    clf = art["clf"]
+    proba = clf.predict_proba(X)[:, 1]
+    preds = (proba >= 0.5).astype(int)
+    return proba, preds
+
 # ---- HTML renderer: sortable top hits + cute summary ----
 def build_preview_html(df_out: pd.DataFrame, threshold: float, top_n: int = 50):
     has_domain = "domain" in df_out.columns
     has_dtype  = "datatype" in df_out.columns
     has_nli    = "nli_vague" in df_out.columns
     has_fuse   = "bs_score" in df_out.columns
+    has_tiny   = "tiny_prob" in df_out.columns
 
     parts = []
     if has_dtype:
@@ -202,6 +303,7 @@ def build_preview_html(df_out: pd.DataFrame, threshold: float, top_n: int = 50):
     headers += ["vagueness_score"]
     if has_nli:   headers += ["nli_vague","nli_label"]
     if has_fuse:  headers += ["bs_score"]
+    if has_tiny:  headers += ["tiny_prob","tiny_pred"]
     headers += ["label","weasel_cnt","passive_cnt","text (highlighted)"]
 
     head = df_out.head(top_n)
@@ -213,9 +315,11 @@ def build_preview_html(df_out: pd.DataFrame, threshold: float, top_n: int = 50):
         if has_dtype:  tds.append(str(row.get("datatype","")))
         tds.append(f"{row['vagueness_score']:.3f}")
         if has_nli:
-            tds += [f"{row['nli_vague']:.3f}", str(row.get("nli_label",""))]
+            tds += [f"{row.get('nli_vague',0.0):.3f}", str(row.get("nli_label",""))]
         if has_fuse:
-            tds.append(f"{row['bs_score']:.3f}")
+            tds.append(f"{row.get('bs_score',0.0):.3f}")
+        if has_tiny:
+            tds += [f"{row.get('tiny_prob',0.0):.3f}", str(row.get("tiny_pred",""))]
         tds += [str(row.get("label","")), str(row.get("weasel_cnt","")), str(row.get("passive_cnt","")), f'<div class="txt">{html_txt}</div>']
         rows_html.append("<tr>" + "".join(f"<td>{x}</td>" for x in tds) + "</tr>")
 
@@ -267,8 +371,37 @@ def main():
                     help="combine rules+NLI: none/avg/and/or")
     ap.add_argument("--alpha", type=float, default=0.5, help="when fuse=avg: alpha*rules + (1-alpha)*NLI")
 
+    # tiny supervised layer knobs
+    ap.add_argument("--supervised", action="store_true", help="train the tiny logistic layer from seed labels")
+    ap.add_argument("--seed_csv", type=str, default="seeds.csv", help="CSV with columns: text,y (y in {0,1})")
+    ap.add_argument("--embed_model", type=str, default="BAAI/bge-small-en-v1.5",
+                    help="Sentence embedding model, e.g., BAAI/bge-small-en-v1.5 or intfloat/e5-base-v2")
+    ap.add_argument("--train_ratio", type=float, default=0.8, help="train split ratio for seed labels")
+    ap.add_argument("--save_clf", type=str, default="tiny_clf.joblib", help="where to save the trained tiny classifier")
+    ap.add_argument("--load_clf", type=str, default=None, help="load a saved tiny classifier for inference")
+
+    # single-text quick classify (rules/NLI/tiny)
+    ap.add_argument("--text", type=str, default=None, help="classify a single text instead of dataset")
+
     args = ap.parse_args()
 
+    # single-text path: no dataset IO, just run and print
+    if args.text is not None:
+        t = args.text.strip()
+        r = compute_vagueness_score(t, threshold=args.threshold)
+        res = {"vagueness_score": r.score, "features": r.features, "rule_label": r.label}
+        # optional NLI
+        if args.zeroshot:
+            n_v, n_s, n_l = run_zeroshot_nli([t], model_name=args.nli_model, batch_size=1)
+            res.update({"nli_vague": n_v[0], "nli_label": n_l[0]})
+        # optional tiny
+        if args.load_clf:
+            probs, preds = predict_with_tiny([t], model_path=args.load_clf, embed_model=args.embed_model)
+            res.update({"tiny_prob": float(probs[0]), "tiny_pred": int(preds[0])})
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return
+
+    # dataset path
     csv_path = get_dataset_csv_path()
     print("CSV:", csv_path)
     df = load_samples(csv_path, max_docs=args.max_docs)
@@ -276,12 +409,12 @@ def main():
         df = df[df["datatype"].str.lower().eq("report")]
 
     # rules pass
-    scores, labels, feats = [], [], []
+    scores, feats = [], []
     for txt in df["text"].astype(str):
         r = compute_vagueness_score(txt, threshold=args.threshold)
-        scores.append(r.score); labels.append(r.label); feats.append(r.features)
+        scores.append(r.score); feats.append(r.features)
 
-    # zero-shot pass (optional, but why not – you have a GPU)
+    # zero-shot pass (optional)
     nli_vague = nli_spec = nli_label = []
     if args.zeroshot:
         print(f"[nli] running zero-shot on {args.nli_model} ...")
@@ -304,8 +437,8 @@ def main():
         ]
     out = pd.concat(parts, axis=1)
 
-    # fusion (rules + NLI) into a single score we can sort/threshold on
-    if args.zeroshot and args.fuse != "none":
+    # fusion (rules + NLI)
+    if args.zeroshot and len(out) and args.fuse != "none":
         if args.fuse == "avg":
             out["bs_score"] = args.alpha*out["vagueness_score"] + (1-args.alpha)*out["nli_vague"]
         elif args.fuse == "and":
@@ -326,11 +459,30 @@ def main():
         print(f"[auto] threshold(from quantile={args.quantile}) = {thr:.3f}")
     out["label"] = (out[score_col] >= thr).astype(int)
 
+    # === tiny supervised: train or predict, attach to out ===
+    if args.supervised:
+        try:
+            train_tiny_supervised(seed_csv=args.seed_csv, embed_model=args.embed_model,
+                                  train_ratio=args.train_ratio, save_path=args.save_clf)
+        except Exception as e:
+            print(f"[tiny] training failed: {e}")
+
+    if args.load_clf:
+        try:
+            probs, preds = predict_with_tiny(out["text"].astype(str).tolist(),
+                                             model_path=args.load_clf, embed_model=args.embed_model)
+            out["tiny_prob"] = probs
+            out["tiny_pred"] = preds
+            print("[tiny] attached tiny layer outputs to dataframe.")
+        except Exception as e:
+            print(f"[tiny] inference failed: {e}")
+
     # dump files + pretty page
     out.to_csv("dax_vagueness_scores.csv", index=False, encoding="utf-8")
     print(f"Saved: dax_vagueness_scores.csv (rows={len(out)})")
     build_preview_html(out, threshold=thr, top_n=50)
-    print(f"BS rate: {out['label'].mean():.1%} | mean {score_col}: {out[score_col].mean():.3f} | threshold: {thr:.2f}")
+    metric_col = "bs_score" if "bs_score" in out.columns else "vagueness_score"
+    print(f"BS rate: {out['label'].mean():.1%} | mean {metric_col}: {out[metric_col].mean():.3f} | threshold: {thr:.2f}")
 
 if __name__ == "__main__":
     main()
