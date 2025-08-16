@@ -1,5 +1,7 @@
 name: bs-detector
 channels:
+  - pytorch
+  - nvidia
   - conda-forge
 dependencies:
   - python=3.10
@@ -7,5 +9,11 @@ dependencies:
   - numpy
   - pyarrow
   - pip
+  # GPU stack
+  - pytorch        # gets the matching torch build
+  - pytorch-cuda=12.1  # CUDA runtime; needs the nvidia channel above
   - pip:
       - kagglehub
+      - transformers>=4.43
+      - accelerate>=0.33
+
