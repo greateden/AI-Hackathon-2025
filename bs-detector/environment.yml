@@ -1,0 +1,11 @@
+name: bs-detector
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pandas>=2.2
+  - numpy
+  - pyarrow
+  - pip
+  - pip:
+      - kagglehub
